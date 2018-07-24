@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -15,6 +16,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/connmgr"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcutil"
 	"github.com/coreos/bbolt"
 	"github.com/go-errors/errors"
 	"github.com/lightningnetwork/lightning-onion"
@@ -24,16 +30,28 @@ import (
 	"github.com/lightningnetwork/lnd/contractcourt"
 	"github.com/lightningnetwork/lnd/discovery"
 	"github.com/lightningnetwork/lnd/htlcswitch"
+	"github.com/lightningnetwork/lnd/lncfg"
+	"github.com/lightningnetwork/lnd/lnpeer"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/nat"
 	"github.com/lightningnetwork/lnd/routing"
 	"github.com/lightningnetwork/lnd/tor"
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcd/chaincfg/chainhash"
-	"github.com/roasbeef/btcd/connmgr"
-	"github.com/roasbeef/btcd/wire"
-	"github.com/roasbeef/btcutil"
+)
+
+const (
+	// defaultMinPeers is the minimum number of peers nodes should always be
+	// connected to.
+	defaultMinPeers = 3
+
+	// defaultBackoff is the starting point for exponential backoff for
+	// reconnecting to persistent peers.
+	defaultBackoff = time.Second
+
+	// maximumBackoff is the largest backoff we will permit when
+	// reattempting connections to persistent peers.
+	maximumBackoff = time.Hour
 )
 
 var (
@@ -44,14 +62,6 @@ var (
 	// ErrServerShuttingDown indicates that the server is in the process of
 	// gracefully exiting.
 	ErrServerShuttingDown = errors.New("server is shutting down")
-
-	// defaultBackoff is the starting point for exponential backoff for
-	// reconnecting to persistent peers.
-	defaultBackoff = time.Second
-
-	// maximumBackoff is the largest backoff we will permit when
-	// reattempting connections to persistent peers.
-	maximumBackoff = time.Hour
 )
 
 // server is the main server of the Lightning Network Daemon. The server houses
@@ -76,7 +86,7 @@ type server struct {
 
 	// listenAddrs is the list of addresses the server is currently
 	// listening on.
-	listenAddrs []string
+	listenAddrs []net.Addr
 
 	// torController is a client that will communicate with a locally
 	// running Tor server. This client will handle initiating and
@@ -84,13 +94,23 @@ type server struct {
 	// creating and setting up onion services, etc.
 	torController *tor.Controller
 
+	// natTraversal is the specific NAT traversal technique used to
+	// automatically set up port forwarding rules in order to advertise to
+	// the network that the node is accepting inbound connections.
+	natTraversal nat.Traversal
+
+	// lastDetectedIP is the last IP detected by the NAT traversal technique
+	// above. This IP will be watched periodically in a goroutine in order
+	// to handle dynamic IP changes.
+	lastDetectedIP net.IP
+
 	mu         sync.RWMutex
 	peersByPub map[string]*peer
 
 	inboundPeers  map[string]*peer
 	outboundPeers map[string]*peer
 
-	peerConnectedListeners map[string][]chan<- struct{}
+	peerConnectedListeners map[string][]chan<- lnpeer.Peer
 
 	persistentPeers        map[string]struct{}
 	persistentPeersBackoff map[string]time.Duration
@@ -188,17 +208,19 @@ func parseAddr(address string) (net.Addr, error) {
 
 // newServer creates a new instance of the server which is to listen using the
 // passed listener address.
-func newServer(listenAddrs []string, chanDB *channeldb.DB, cc *chainControl,
+func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
 	privKey *btcec.PrivateKey) (*server, error) {
 
 	var err error
 
 	listeners := make([]net.Listener, len(listenAddrs))
-	for i, addr := range listenAddrs {
+	for i, listenAddr := range listenAddrs {
 		// Note: though brontide.NewListener uses ResolveTCPAddr, it
 		// doesn't need to call the general lndResolveTCP function
 		// since we are resolving a local address.
-		listeners[i], err = brontide.NewListener(privKey, addr)
+		listeners[i], err = brontide.NewListener(
+			privKey, listenAddr.String(),
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -242,7 +264,7 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB, cc *chainControl,
 		peersByPub:             make(map[string]*peer),
 		inboundPeers:           make(map[string]*peer),
 		outboundPeers:          make(map[string]*peer),
-		peerConnectedListeners: make(map[string][]chan<- struct{}),
+		peerConnectedListeners: make(map[string][]chan<- lnpeer.Peer),
 
 		globalFeatures: lnwire.NewFeatureVector(globalFeatures,
 			lnwire.GlobalFeatures),
@@ -263,6 +285,11 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB, cc *chainControl,
 		s.invoices.AddDebugInvoice(kiloCoin, *debugPre)
 		srvrLog.Debugf("Debug HTLC invoice inserted, preimage=%x, hash=%x",
 			debugPre[:], debugHash[:])
+	}
+
+	_, currentHeight, err := s.cc.chainIO.GetBestBlock()
+	if err != nil {
+		return nil, err
 	}
 
 	s.htlcSwitch, err = htlcswitch.New(htlcswitch.Config{
@@ -294,21 +321,92 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB, cc *chainControl,
 		SwitchPackager:         channeldb.NewSwitchPackager(),
 		ExtractErrorEncrypter:  s.sphinx.ExtractErrorEncrypter,
 		FetchLastChannelUpdate: fetchLastChanUpdate(s, serializedPubKey),
-	})
+		Notifier:               s.cc.chainNotifier,
+	}, uint32(currentHeight))
 	if err != nil {
 		return nil, err
 	}
 
-	// If external IP addresses have been specified, add those to the list
-	// of this server's addresses.
-	selfAddrs := make([]net.Addr, 0, len(cfg.ExternalIPs))
-	for _, ip := range cfg.ExternalIPs {
-		addr, err := parseAddr(ip)
-		if err != nil {
-			return nil, err
+	// If enabled, use either UPnP or NAT-PMP to automatically configure
+	// port forwarding for users behind a NAT.
+	if cfg.NAT {
+		srvrLog.Info("Scanning local network for a UPnP enabled device")
+
+		discoveryTimeout := time.Duration(10 * time.Second)
+
+		ctx, cancel := context.WithTimeout(
+			context.Background(), discoveryTimeout,
+		)
+		defer cancel()
+		upnp, err := nat.DiscoverUPnP(ctx)
+		if err == nil {
+			s.natTraversal = upnp
+		} else {
+			// If we were not able to discover a UPnP enabled device
+			// on the local network, we'll fall back to attempting
+			// to discover a NAT-PMP enabled device.
+			srvrLog.Errorf("Unable to discover a UPnP enabled "+
+				"device on the local network: %v", err)
+
+			srvrLog.Info("Scanning local network for a NAT-PMP " +
+				"enabled device")
+
+			pmp, err := nat.DiscoverPMP(discoveryTimeout)
+			if err != nil {
+				err := fmt.Errorf("Unable to discover a "+
+					"NAT-PMP enabled device on the local "+
+					"network: %v", err)
+				srvrLog.Error(err)
+				return nil, err
+			}
+
+			s.natTraversal = pmp
+		}
+	}
+
+	// If we were requested to automatically configure port forwarding,
+	// we'll use the ports that the server will be listening on.
+	externalIpStrings := make([]string, len(cfg.ExternalIPs))
+	for idx, ip := range cfg.ExternalIPs {
+		externalIpStrings[idx] = ip.String()
+	}
+	if s.natTraversal != nil {
+		listenPorts := make([]uint16, 0, len(listenAddrs))
+		for _, listenAddr := range listenAddrs {
+			// At this point, the listen addresses should have
+			// already been normalized, so it's safe to ignore the
+			// errors.
+			_, portStr, _ := net.SplitHostPort(listenAddr.String())
+			port, _ := strconv.Atoi(portStr)
+
+			listenPorts = append(listenPorts, uint16(port))
 		}
 
-		selfAddrs = append(selfAddrs, addr)
+		ips, err := s.configurePortForwarding(listenPorts...)
+		if err != nil {
+			srvrLog.Errorf("Unable to automatically set up port "+
+				"forwarding using %s: %v",
+				s.natTraversal.Name(), err)
+		} else {
+			srvrLog.Infof("Automatically set up port forwarding "+
+				"using %s to advertise external IP",
+				s.natTraversal.Name())
+			externalIpStrings = append(externalIpStrings, ips...)
+		}
+	}
+
+	// If external IP addresses have been specified, add those to the list
+	// of this server's addresses.
+	externalIPs, err := lncfg.NormalizeAddresses(
+		externalIpStrings, strconv.Itoa(defaultPeerPort),
+		cfg.net.ResolveTCPAddr,
+	)
+	if err != nil {
+		return nil, err
+	}
+	selfAddrs := make([]net.Addr, 0, len(externalIPs))
+	for _, ip := range externalIPs {
+		selfAddrs = append(selfAddrs, ip)
 	}
 
 	// If we were requested to route connections through Tor and to
@@ -435,12 +533,15 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB, cc *chainControl,
 	}
 
 	s.authGossiper, err = discovery.New(discovery.Config{
-		Router:           s.chanRouter,
-		Notifier:         s.cc.chainNotifier,
-		ChainHash:        *activeNetParams.GenesisHash,
-		Broadcast:        s.BroadcastMessage,
-		ChanSeries:       &chanSeries{s.chanDB.ChannelGraph()},
-		SendToPeer:       s.SendToPeer,
+		Router:     s.chanRouter,
+		Notifier:   s.cc.chainNotifier,
+		ChainHash:  *activeNetParams.GenesisHash,
+		Broadcast:  s.BroadcastMessage,
+		ChanSeries: &chanSeries{s.chanDB.ChannelGraph()},
+		SendToPeer: s.SendToPeer,
+		FindPeer: func(pub *btcec.PublicKey) (lnpeer.Peer, error) {
+			return s.FindPeer(pub)
+		},
 		NotifyWhenOnline: s.NotifyWhenOnline,
 		ProofMatureDelta: 0,
 		TrickleDelay:     time.Millisecond * time.Duration(cfg.TrickleDelay),
@@ -560,6 +661,7 @@ func newServer(listenAddrs []string, chanDB *channeldb.DB, cc *chainControl,
 				return ErrServerShuttingDown
 			}
 		},
+		DisableChannel: s.disableChannel,
 	}, chanDB)
 
 	s.breachArbiter = newBreachArbiter(&BreachConfig{
@@ -616,6 +718,11 @@ func (s *server) Start() error {
 		}
 	}
 
+	if s.natTraversal != nil {
+		s.wg.Add(1)
+		go s.watchExternalIP()
+	}
+
 	// Start the notification server. This is used so channel management
 	// goroutines can be notified when a funding transaction reaches a
 	// sufficient number of confirmations, or when the input for the
@@ -645,15 +752,23 @@ func (s *server) Start() error {
 	if err := s.chanRouter.Start(); err != nil {
 		return err
 	}
+	s.connMgr.Start()
 
-	// With all the relevant sub-systems started, we'll now attempt to
-	// establish persistent connections to our direct channel collaborators
-	// within the network.
-	if err := s.establishPersistentConnections(); err != nil {
+	if err := s.invoices.Start(); err != nil {
 		return err
 	}
 
-	go s.connMgr.Start()
+	// With all the relevant sub-systems started, we'll now attempt to
+	// establish persistent connections to our direct channel collaborators
+	// within the network. Before doing so however, we'll prune our set of
+	// link nodes found within the database to ensure we don't reconnect to
+	// any nodes we no longer have open channels with.
+	if err := s.chanDB.PruneLinkNodes(); err != nil {
+		return err
+	}
+	if err := s.establishPersistentConnections(); err != nil {
+		return err
+	}
 
 	// If network bootstrapping hasn't been disabled, then we'll configure
 	// the set of active bootstrappers, and launch a dedicated goroutine to
@@ -661,13 +776,13 @@ func (s *server) Start() error {
 	if !cfg.NoNetBootstrap && !(cfg.Bitcoin.SimNet || cfg.Litecoin.SimNet) &&
 		!(cfg.Bitcoin.RegTest || cfg.Litecoin.RegTest) {
 
-		networkBootStrappers, err := initNetworkBootstrappers(s)
+		bootstrappers, err := initNetworkBootstrappers(s)
 		if err != nil {
 			return err
 		}
 
 		s.wg.Add(1)
-		go s.peerBootstrapper(3, networkBootStrappers)
+		go s.peerBootstrapper(defaultMinPeers, bootstrappers)
 	} else {
 		srvrLog.Infof("Auto peer bootstrapping is disabled")
 	}
@@ -704,6 +819,7 @@ func (s *server) Stop() error {
 	s.cc.chainView.Stop()
 	s.connMgr.Stop()
 	s.cc.feeEstimator.Stop()
+	s.invoices.Stop()
 
 	// Disconnect from each active peers to ensure that
 	// peerTerminationWatchers signal completion to each peer.
@@ -721,6 +837,172 @@ func (s *server) Stop() error {
 // NOTE: This function is safe for concurrent access.
 func (s *server) Stopped() bool {
 	return atomic.LoadInt32(&s.shutdown) != 0
+}
+
+// configurePortForwarding attempts to set up port forwarding for the diffrent
+// ports that the server will be listening on.
+//
+// NOTE: This should only be used when using some kind of NAT traversal to
+// automatically set up forwarding rules.
+func (s *server) configurePortForwarding(ports ...uint16) ([]string, error) {
+	ip, err := s.natTraversal.ExternalIP()
+	if err != nil {
+		return nil, err
+	}
+	s.lastDetectedIP = ip
+
+	externalIPs := make([]string, 0, len(ports))
+	for _, port := range ports {
+		if err := s.natTraversal.AddPortMapping(port); err != nil {
+			srvrLog.Debugf("Unable to forward port %d: %v", port, err)
+			continue
+		}
+
+		hostIP := fmt.Sprintf("%v:%d", ip, port)
+		externalIPs = append(externalIPs, hostIP)
+	}
+
+	return externalIPs, nil
+}
+
+// removePortForwarding attempts to clear the forwarding rules for the different
+// ports the server is currently listening on.
+//
+// NOTE: This should only be used when using some kind of NAT traversal to
+// automatically set up forwarding rules.
+func (s *server) removePortForwarding() {
+	forwardedPorts := s.natTraversal.ForwardedPorts()
+	for _, port := range forwardedPorts {
+		if err := s.natTraversal.DeletePortMapping(port); err != nil {
+			srvrLog.Errorf("Unable to remove forwarding rules for "+
+				"port %d: %v", port, err)
+		}
+	}
+}
+
+// watchExternalIP continously checks for an updated external IP address every
+// 15 minutes. Once a new IP address has been detected, it will automatically
+// handle port forwarding rules and send updated node announcements to the
+// currently connected peers.
+//
+// NOTE: This MUST be run as a goroutine.
+func (s *server) watchExternalIP() {
+	defer s.wg.Done()
+
+	// Before exiting, we'll make sure to remove the forwarding rules set
+	// up by the server.
+	defer s.removePortForwarding()
+
+	// Keep track of the external IPs set by the user to avoid replacing
+	// them when detecting a new IP.
+	ipsSetByUser := make(map[string]struct{})
+	for _, ip := range cfg.ExternalIPs {
+		ipsSetByUser[ip.String()] = struct{}{}
+	}
+
+	forwardedPorts := s.natTraversal.ForwardedPorts()
+
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+out:
+	for {
+		select {
+		case <-ticker.C:
+			// We'll start off by making sure a new IP address has
+			// been detected.
+			ip, err := s.natTraversal.ExternalIP()
+			if err != nil {
+				srvrLog.Debugf("Unable to retrieve the "+
+					"external IP address: %v", err)
+				continue
+			}
+
+			if ip.Equal(s.lastDetectedIP) {
+				continue
+			}
+
+			srvrLog.Infof("Detected new external IP address %s", ip)
+
+			// Next, we'll craft the new addresses that will be
+			// included in the new node announcement and advertised
+			// to the network. Each address will consist of the new
+			// IP detected and one of the currently advertised
+			// ports.
+			var newAddrs []net.Addr
+			for _, port := range forwardedPorts {
+				hostIP := fmt.Sprintf("%v:%d", ip, port)
+				addr, err := net.ResolveTCPAddr("tcp", hostIP)
+				if err != nil {
+					srvrLog.Debugf("Unable to resolve "+
+						"host %v: %v", addr, err)
+					continue
+				}
+
+				newAddrs = append(newAddrs, addr)
+			}
+
+			// Skip the update if we weren't able to resolve any of
+			// the new addresses.
+			if len(newAddrs) == 0 {
+				srvrLog.Debug("Skipping node announcement " +
+					"update due to not being able to " +
+					"resolve any new addresses")
+				continue
+			}
+
+			// Now, we'll need to update the addresses in our node's
+			// announcement in order to propogate the update
+			// throughout the network. We'll only include addresses
+			// that have a different IP from the previous one, as
+			// the previous IP is no longer valid.
+			currentNodeAnn, err := s.genNodeAnnouncement(false)
+			if err != nil {
+				srvrLog.Debugf("Unable to retrieve current "+
+					"node announcement: %v", err)
+				continue
+			}
+			for _, addr := range currentNodeAnn.Addresses {
+				host, _, err := net.SplitHostPort(addr.String())
+				if err != nil {
+					srvrLog.Debugf("Unable to determine "+
+						"host from address %v: %v",
+						addr, err)
+					continue
+				}
+
+				// We'll also make sure to include external IPs
+				// set manually by the user.
+				_, setByUser := ipsSetByUser[addr.String()]
+				if setByUser || host != s.lastDetectedIP.String() {
+					newAddrs = append(newAddrs, addr)
+				}
+			}
+
+			// Then, we'll generate a new timestamped node
+			// announcement with the updated addresses and broadcast
+			// it to our peers.
+			newNodeAnn, err := s.genNodeAnnouncement(
+				true, lnwire.UpdateNodeAnnAddrs(newAddrs),
+			)
+			if err != nil {
+				srvrLog.Debugf("Unable to generate new node "+
+					"announcement: %v", err)
+				continue
+			}
+
+			err = s.BroadcastMessage(nil, &newNodeAnn)
+			if err != nil {
+				srvrLog.Debugf("Unable to broadcast new node "+
+					"announcement to peers: %v", err)
+				continue
+			}
+
+			// Finally, update the last IP seen to the current one.
+			s.lastDetectedIP = ip
+		case <-s.quit:
+			break out
+		}
+	}
 }
 
 // initNetworkBootstrappers initializes a set of network peer bootstrappers
@@ -763,48 +1045,28 @@ func initNetworkBootstrappers(s *server) ([]discovery.NetworkPeerBootstrapper, e
 }
 
 // peerBootstrapper is a goroutine which is tasked with attempting to establish
-// and maintain a target min number of outbound connections. With this
+// and maintain a target minimum number of outbound connections. With this
 // invariant, we ensure that our node is connected to a diverse set of peers
 // and that nodes newly joining the network receive an up to date network view
 // as soon as possible.
 func (s *server) peerBootstrapper(numTargetPeers uint32,
-	bootStrappers []discovery.NetworkPeerBootstrapper) {
+	bootstrappers []discovery.NetworkPeerBootstrapper) {
 
 	defer s.wg.Done()
 
-	// To kick things off, we'll attempt to first query the set of
-	// bootstrappers for enough address to fill our quot.
-	bootStrapAddrs, err := discovery.MultiSourceBootstrap(
-		nil, numTargetPeers, bootStrappers...,
-	)
-	if err != nil {
-		// TODO(roasbeef): panic?
-		srvrLog.Errorf("Unable to retrieve initial bootstrap "+
-			"peers: %v", err)
-		return
-	}
+	// ignore is a set used to keep track of peers already retrieved from
+	// our bootstrappers in order to avoid duplicates.
+	ignore := make(map[autopilot.NodeID]struct{})
 
-	srvrLog.Debugf("Attempting to bootstrap connectivity with %v initial "+
-		"peers", len(bootStrapAddrs))
+	// We'll start off by aggressively attempting connections to peers in
+	// order to be a part of the network as soon as possible.
+	s.initialPeerBootstrap(ignore, numTargetPeers, bootstrappers)
 
-	// With our initial set of peers obtained, we'll launch a goroutine to
-	// attempt to connect out to each of them. We'll be waking up shortly
-	// below to sample how many of these connections succeeded.
-	for _, addr := range bootStrapAddrs {
-		go func(a *lnwire.NetAddress) {
-			conn, err := brontide.Dial(s.identityPriv, a, cfg.net.Dial)
-			if err != nil {
-				srvrLog.Errorf("unable to connect to %v: %v",
-					a, err)
-				return
-			}
-
-			s.OutboundPeerConnected(nil, conn)
-		}(addr)
-	}
-
-	// We'll start with a 15 second backoff, and double the time every time
-	// an epoch fails up to a ceiling.
+	// Once done, we'll attempt to maintain our target minimum number of
+	// peers.
+	//
+	// We'll use a 15 second backoff, and double the time every time an
+	// epoch fails up to a ceiling.
 	const backOffCeiling = time.Minute * 5
 	backOff := time.Second * 15
 
@@ -880,7 +1142,7 @@ func (s *server) peerBootstrapper(numTargetPeers uint32,
 			s.mu.RUnlock()
 
 			peerAddrs, err := discovery.MultiSourceBootstrap(
-				ignoreList, numNeeded*2, bootStrappers...,
+				ignoreList, numNeeded*2, bootstrappers...,
 			)
 			if err != nil {
 				srvrLog.Errorf("Unable to retrieve bootstrap "+
@@ -896,21 +1158,92 @@ func (s *server) peerBootstrapper(numTargetPeers uint32,
 				go func(a *lnwire.NetAddress) {
 					// TODO(roasbeef): can do AS, subnet,
 					// country diversity, etc
-					conn, err := brontide.Dial(s.identityPriv,
-						a, cfg.net.Dial)
-					if err != nil {
-						srvrLog.Errorf("unable to connect "+
-							"to %v: %v", a, err)
+					errChan := make(chan error, 1)
+					s.connectToPeer(a, errChan)
+					select {
+					case err := <-errChan:
+						srvrLog.Errorf("Unable to "+
+							"connect to %v: %v",
+							a, err)
 						atomic.AddUint32(&epochErrors, 1)
-						return
+					case <-s.quit:
 					}
-
-					s.OutboundPeerConnected(nil, conn)
 				}(addr)
 			}
 		case <-s.quit:
 			return
 		}
+	}
+}
+
+// initialPeerBootstrap attempts to continuously connect to peers on startup
+// until the target number of peers has been reached. This ensures that nodes
+// receive an up to date network view as soon as possible.
+func (s *server) initialPeerBootstrap(ignore map[autopilot.NodeID]struct{},
+	numTargetPeers uint32, bootstrappers []discovery.NetworkPeerBootstrapper) {
+
+	var wg sync.WaitGroup
+
+	for {
+		// Check if the server has been requested to shut down in order
+		// to prevent blocking.
+		if s.Stopped() {
+			return
+		}
+
+		// We can exit our aggressive initial peer bootstrapping stage
+		// if we've reached out target number of peers.
+		s.mu.RLock()
+		numActivePeers := uint32(len(s.peersByPub))
+		s.mu.RUnlock()
+
+		if numActivePeers >= numTargetPeers {
+			return
+		}
+
+		// Otherwise, we'll request for the remaining number of peers in
+		// order to reach our target.
+		peersNeeded := numTargetPeers - numActivePeers
+		bootstrapAddrs, err := discovery.MultiSourceBootstrap(
+			ignore, peersNeeded, bootstrappers...,
+		)
+		if err != nil {
+			srvrLog.Errorf("Unable to retrieve initial bootstrap "+
+				"peers: %v", err)
+			continue
+		}
+
+		// Then, we'll attempt to establish a connection to the
+		// different peer addresses retrieved by our bootstrappers.
+		for _, bootstrapAddr := range bootstrapAddrs {
+			wg.Add(1)
+			go func(addr *lnwire.NetAddress) {
+				defer wg.Done()
+
+				errChan := make(chan error, 1)
+				go s.connectToPeer(addr, errChan)
+
+				// We'll only allow this connection attempt to
+				// take up to 3 seconds. This allows us to move
+				// quickly by discarding peers that are slowing
+				// us down.
+				select {
+				case err := <-errChan:
+					srvrLog.Errorf("Unable to connect to "+
+						"%v: %v", addr, err)
+				// TODO: tune timeout? 3 seconds might be *too*
+				// aggressive but works well.
+				case <-time.After(3 * time.Second):
+					srvrLog.Tracef("Skipping peer %v due "+
+						"to not establishing a "+
+						"connection within 3 seconds",
+						addr)
+				case <-s.quit:
+				}
+			}(bootstrapAddr)
+		}
+
+		wg.Wait()
 	}
 }
 
@@ -929,7 +1262,7 @@ func (s *server) initTorController() error {
 	for _, listenAddr := range s.listenAddrs {
 		// At this point, the listen addresses should have already been
 		// normalized, so it's safe to ignore the errors.
-		_, portStr, _ := net.SplitHostPort(listenAddr)
+		_, portStr, _ := net.SplitHostPort(listenAddr.String())
 		port, _ := strconv.Atoi(portStr)
 		listenPorts[port] = struct{}{}
 	}
@@ -960,8 +1293,8 @@ func (s *server) initTorController() error {
 // genNodeAnnouncement generates and returns the current fully signed node
 // announcement. If refresh is true, then the time stamp of the announcement
 // will be updated in order to ensure it propagates through the network.
-func (s *server) genNodeAnnouncement(
-	refresh bool) (lnwire.NodeAnnouncement, error) {
+func (s *server) genNodeAnnouncement(refresh bool,
+	updates ...func(*lnwire.NodeAnnouncement)) (lnwire.NodeAnnouncement, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -970,7 +1303,9 @@ func (s *server) genNodeAnnouncement(
 		return *s.currentNodeAnn, nil
 	}
 
-	var err error
+	for _, update := range updates {
+		update(s.currentNodeAnn)
+	}
 
 	newStamp := uint32(time.Now().Unix())
 	if newStamp <= s.currentNodeAnn.Timestamp {
@@ -1147,34 +1482,36 @@ func (s *server) establishPersistentConnections() error {
 	return nil
 }
 
-// BroadcastMessage sends a request to the server to broadcast a set of
-// messages to all peers other than the one specified by the `skip` parameter.
-//
-// NOTE: This function is safe for concurrent access.
-func (s *server) BroadcastMessage(skip map[routing.Vertex]struct{},
-	msgs ...lnwire.Message) error {
+// prunePersistentPeerConnection removes all internal state related to
+// persistent connections to a peer within the server. This is used to avoid
+// persistent connection retries to peers we do not have any open channels with.
+func (s *server) prunePersistentPeerConnection(compressedPubKey [33]byte) {
+	srvrLog.Infof("Pruning peer %x from persistent connections, number of "+
+		"open channels is now zero", compressedPubKey)
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	pubKeyStr := string(compressedPubKey[:])
 
-	return s.broadcastMessages(skip, msgs)
+	s.mu.Lock()
+	delete(s.persistentPeers, pubKeyStr)
+	delete(s.persistentPeersBackoff, pubKeyStr)
+	s.cancelConnReqs(pubKeyStr, nil)
+	s.mu.Unlock()
 }
 
-// broadcastMessages is an internal method that delivers messages to all active
-// peers except the one specified by `skip`.
+// BroadcastMessage sends a request to the server to broadcast a set of
+// messages to all peers other than the one specified by the `skips` parameter.
 //
-// NOTE: This method MUST be called while the server's mutex is locked.
-func (s *server) broadcastMessages(
-	skips map[routing.Vertex]struct{},
-	msgs []lnwire.Message) error {
+// NOTE: This function is safe for concurrent access.
+func (s *server) BroadcastMessage(skips map[routing.Vertex]struct{},
+	msgs ...lnwire.Message) error {
 
 	srvrLog.Debugf("Broadcasting %v messages", len(msgs))
 
-	// Iterate over all known peers, dispatching a go routine to enqueue
-	// all messages to each of peers.  We synchronize access to peersByPub
-	// throughout this process to ensure we deliver messages to exact set
-	// of peers present at the time of invocation.
-	var wg sync.WaitGroup
+	// Filter out peers found in the skips map. We synchronize access to
+	// peersByPub throughout this process to ensure we deliver messages to
+	// exact set of peers present at the time of invocation.
+	s.mu.RLock()
+	peers := make([]*peer, 0, len(s.peersByPub))
 	for _, sPeer := range s.peersByPub {
 		if skips != nil {
 			if _, ok := skips[sPeer.pubKeyBytes]; ok {
@@ -1184,6 +1521,14 @@ func (s *server) broadcastMessages(
 			}
 		}
 
+		peers = append(peers, sPeer)
+	}
+	s.mu.RUnlock()
+
+	// Iterate over all known peers, dispatching a go routine to enqueue
+	// all messages to each of peers.
+	var wg sync.WaitGroup
+	for _, sPeer := range peers {
 		// Dispatch a go routine to enqueue all messages to this peer.
 		wg.Add(1)
 		s.wg.Add(1)
@@ -1205,15 +1550,28 @@ func (s *server) broadcastMessages(
 func (s *server) SendToPeer(target *btcec.PublicKey,
 	msgs ...lnwire.Message) error {
 
-	// Queue the incoming messages in the peer's outgoing message buffer.
-	// We acquire the shared lock here to ensure the peer map doesn't change
-	// from underneath us.
+	// Compute the target peer's identifier.
+	targetPubBytes := target.SerializeCompressed()
+
+	srvrLog.Tracef("Attempting to send msgs %v to: %x",
+		len(msgs), targetPubBytes)
+
+	// Lookup intended target in peersByPub, returning an error to the
+	// caller if the peer is unknown.  Access to peersByPub is synchronized
+	// here to ensure we consider the exact set of peers present at the
+	// time of invocation.
 	s.mu.RLock()
-	targetPeer, errChans, err := s.sendToPeer(target, msgs)
+	targetPeer, err := s.findPeerByPubStr(string(targetPubBytes))
 	s.mu.RUnlock()
-	if err != nil {
+	if err == ErrPeerNotConnected {
+		srvrLog.Errorf("unable to send message to %x, "+
+			"peer is not connected", targetPubBytes)
 		return err
 	}
+
+	// Send messages to the peer and get the error channels that will be
+	// signaled by the peer's write handler.
+	errChans := s.sendPeerMessages(targetPeer, msgs, nil)
 
 	// With the server's shared lock released, we now handle all of the
 	// errors being returned from the target peer's write handler.
@@ -1232,62 +1590,38 @@ func (s *server) SendToPeer(target *btcec.PublicKey,
 }
 
 // NotifyWhenOnline can be called by other subsystems to get notified when a
-// particular peer comes online.
+// particular peer comes online. The peer itself is sent across the peerChan.
 //
 // NOTE: This function is safe for concurrent access.
-func (s *server) NotifyWhenOnline(peer *btcec.PublicKey,
-	connectedChan chan<- struct{}) {
+func (s *server) NotifyWhenOnline(peerKey *btcec.PublicKey,
+	peerChan chan<- lnpeer.Peer) {
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	// Compute the target peer's identifier.
-	pubStr := string(peer.SerializeCompressed())
+	pubStr := string(peerKey.SerializeCompressed())
 
 	// Check if peer is connected.
-	_, ok := s.peersByPub[pubStr]
+	peer, ok := s.peersByPub[pubStr]
 	if ok {
 		// Connected, can return early.
 		srvrLog.Debugf("Notifying that peer %x is online",
-			peer.SerializeCompressed())
-		close(connectedChan)
+			peerKey.SerializeCompressed())
+
+		select {
+		case peerChan <- peer:
+		case <-s.quit:
+		}
+
 		return
 	}
 
 	// Not connected, store this listener such that it can be notified when
 	// the peer comes online.
 	s.peerConnectedListeners[pubStr] = append(
-		s.peerConnectedListeners[pubStr], connectedChan)
-}
-
-// sendToPeer is an internal method that queues the given messages in the
-// outgoing buffer of the specified `target` peer. Upon success, this method
-// returns the peer instance and a slice of error chans that will contain
-// responses from the write handler.
-func (s *server) sendToPeer(target *btcec.PublicKey,
-	msgs []lnwire.Message) (*peer, []chan error, error) {
-
-	// Compute the target peer's identifier.
-	targetPubBytes := target.SerializeCompressed()
-
-	srvrLog.Tracef("Attempting to send msgs %v to: %x",
-		len(msgs), targetPubBytes)
-
-	// Lookup intended target in peersByPub, returning an error to the
-	// caller if the peer is unknown.  Access to peersByPub is synchronized
-	// here to ensure we consider the exact set of peers present at the
-	// time of invocation.
-	targetPeer, err := s.findPeerByPubStr(string(targetPubBytes))
-	if err == ErrPeerNotConnected {
-		srvrLog.Errorf("unable to send message to %x, "+
-			"peer is not connected", targetPubBytes)
-		return nil, nil, err
-	}
-
-	// Send messages to the peer and return the error channels that will be
-	// signaled by the peer's write handler.
-	errChans := s.sendPeerMessages(targetPeer, msgs, nil)
-
-	return targetPeer, errChans, nil
+		s.peerConnectedListeners[pubStr], peerChan,
+	)
 }
 
 // sendPeerMessages enqueues a list of messages into the outgoingQueue of the
@@ -1404,9 +1738,11 @@ func (s *server) peerTerminationWatcher(p *peer) {
 	// available for use.
 	s.fundingMgr.CancelPeerReservations(p.PubKey())
 
+	pubKey := p.addr.IdentityKey
+
 	// We'll also inform the gossiper that this peer is no longer active,
 	// so we don't need to maintain sync state for it any longer.
-	s.authGossiper.PruneSyncState(p.addr.IdentityKey)
+	s.authGossiper.PruneSyncState(pubKey)
 
 	// Tell the switch to remove all links associated with this peer.
 	// Passing nil as the target link indicates that all links associated
@@ -1455,13 +1791,30 @@ func (s *server) peerTerminationWatcher(p *peer) {
 	s.removePeer(p)
 
 	// Next, check to see if this is a persistent peer or not.
-	pubStr := string(p.addr.IdentityKey.SerializeCompressed())
+	pubStr := string(pubKey.SerializeCompressed())
 	_, ok := s.persistentPeers[pubStr]
 	if ok {
 		// We'll only need to re-launch a connection request if one
 		// isn't already currently pending.
 		if _, ok := s.persistentConnReqs[pubStr]; ok {
 			return
+		}
+
+		// We'll ensure that we locate an advertised address to use
+		// within the peer's address for reconnection purposes.
+		//
+		// TODO(roasbeef): use them all?
+		if p.inbound {
+			advertisedAddr, err := s.fetchNodeAdvertisedAddr(
+				pubKey,
+			)
+			if err != nil {
+				srvrLog.Errorf("Unable to retrieve advertised "+
+					"address for node %x: %v",
+					pubKey.SerializeCompressed(), err)
+			} else {
+				p.addr.Address = advertisedAddr
+			}
 		}
 
 		// Otherwise, we'll launch a new connection request in order to
@@ -1537,7 +1890,8 @@ func (s *server) shouldRequestGraphSync() bool {
 
 // peerConnected is a function that handles initialization a newly connected
 // peer by adding it to the server's global list of all active peers, and
-// starting all the goroutines the peer needs to function properly.
+// starting all the goroutines the peer needs to function properly. The inbound
+// boolean should be true if the peer initiated the connection to us.
 func (s *server) peerConnected(conn net.Conn, connReq *connmgr.ConnReq,
 	inbound bool) {
 
@@ -1545,20 +1899,8 @@ func (s *server) peerConnected(conn net.Conn, connReq *connmgr.ConnReq,
 	addr := conn.RemoteAddr()
 	pubKey := brontideConn.RemotePub()
 
-	// We'll ensure that we locate an advertised address to use within the
-	// peer's address for reconnection purposes.
-	//
-	// TODO: leave the address field empty if there aren't any?
-	if !inbound {
-		advertisedAddr, err := s.fetchNodeAdvertisedAddr(pubKey)
-		if err != nil {
-			srvrLog.Errorf("Unable to retrieve advertised address "+
-				"for node %x: %v", pubKey.SerializeCompressed(),
-				err)
-		} else {
-			addr = advertisedAddr
-		}
-	}
+	srvrLog.Infof("finalizing connection to %x, inbound=%v",
+		pubKey.SerializeCompressed(), inbound)
 
 	peerAddr := &lnwire.NetAddress{
 		IdentityKey: pubKey,
@@ -1637,10 +1979,13 @@ func (s *server) InboundPeerConnected(conn net.Conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// If we already have an inbound connection to this peer, then ignore
+	// If we already have an outbound connection to this peer, then ignore
 	// this new connection.
-	if _, ok := s.inboundPeers[pubStr]; ok {
-		srvrLog.Debugf("Ignoring duplicate inbound connection")
+	if _, ok := s.outboundPeers[pubStr]; ok {
+		srvrLog.Debugf("Already have outbound connection for %x, "+
+			"ignoring inbound connection",
+			nodePub.SerializeCompressed())
+
 		conn.Close()
 		return
 	}
@@ -1656,12 +2001,6 @@ func (s *server) InboundPeerConnected(conn net.Conn) {
 
 	srvrLog.Infof("New inbound connection from %v", conn.RemoteAddr())
 
-	// Cancel all pending connection requests, we either already have an
-	// outbound connection, or this incoming connection will become our
-	// primary connection. The incoming connection will not have an
-	// associated connection request, so we pass nil.
-	s.cancelConnReqs(pubStr, nil)
-
 	// Check to see if we already have a connection with this peer. If so,
 	// we may need to drop our existing connection. This prevents us from
 	// having duplicate connections to the same peer. We forgo adding a
@@ -1672,7 +2011,8 @@ func (s *server) InboundPeerConnected(conn net.Conn) {
 	case ErrPeerNotConnected:
 		// We were unable to locate an existing connection with the
 		// target peer, proceed to connect.
-		s.peerConnected(conn, nil, false)
+		s.cancelConnReqs(pubStr, nil)
+		s.peerConnected(conn, nil, true)
 
 	case nil:
 		// We already have a connection with the incoming peer. If the
@@ -1693,13 +2033,15 @@ func (s *server) InboundPeerConnected(conn net.Conn) {
 		srvrLog.Debugf("Disconnecting stale connection to %v",
 			connectedPeer)
 
+		s.cancelConnReqs(pubStr, nil)
+
 		// Remove the current peer from the server's internal state and
 		// signal that the peer termination watcher does not need to
 		// execute for this peer.
 		s.removePeer(connectedPeer)
 		s.ignorePeerTermination[connectedPeer] = struct{}{}
 		s.scheduledPeerConnection[pubStr] = func() {
-			s.peerConnected(conn, nil, false)
+			s.peerConnected(conn, nil, true)
 		}
 	}
 }
@@ -1720,10 +2062,13 @@ func (s *server) OutboundPeerConnected(connReq *connmgr.ConnReq, conn net.Conn) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// If we already have an outbound connection to this peer, then ignore
+	// If we already have an inbound connection to this peer, then ignore
 	// this new connection.
-	if _, ok := s.outboundPeers[pubStr]; ok {
-		srvrLog.Debugf("Ignoring duplicate outbound connection")
+	if _, ok := s.inboundPeers[pubStr]; ok {
+		srvrLog.Debugf("Already have inbound connection for %x, "+
+			"ignoring outbound connection",
+			nodePub.SerializeCompressed())
+
 		if connReq != nil {
 			s.connMgr.Remove(connReq.ID())
 		}
@@ -1742,6 +2087,11 @@ func (s *server) OutboundPeerConnected(connReq *connmgr.ConnReq, conn net.Conn) 
 	// ignore this connection.
 	if _, ok := s.scheduledPeerConnection[pubStr]; ok {
 		srvrLog.Debugf("Ignoring connection, peer already scheduled")
+
+		if connReq != nil {
+			s.connMgr.Remove(connReq.ID())
+		}
+
 		conn.Close()
 		return
 	}
@@ -1769,7 +2119,7 @@ func (s *server) OutboundPeerConnected(connReq *connmgr.ConnReq, conn net.Conn) 
 	case ErrPeerNotConnected:
 		// We were unable to locate an existing connection with the
 		// target peer, proceed to connect.
-		s.peerConnected(conn, connReq, true)
+		s.peerConnected(conn, connReq, false)
 
 	case nil:
 		// We already have a connection open with the target peer.
@@ -1800,7 +2150,7 @@ func (s *server) OutboundPeerConnected(connReq *connmgr.ConnReq, conn net.Conn) 
 		s.removePeer(connectedPeer)
 		s.ignorePeerTermination[connectedPeer] = struct{}{}
 		s.scheduledPeerConnection[pubStr] = func() {
-			s.peerConnected(conn, connReq, true)
+			s.peerConnected(conn, connReq, false)
 		}
 	}
 }
@@ -1905,7 +2255,7 @@ func (s *server) addPeer(p *peer) {
 		// TODO(roasbeef): craft s.t. we only get updates from a few
 		// peers
 		recvUpdates := !cfg.NoChanUpdates
-		go s.authGossiper.InitSyncState(p.addr.IdentityKey, recvUpdates)
+		go s.authGossiper.InitSyncState(p, recvUpdates)
 
 	// If the remote peer has the initial sync feature bit set, then we'll
 	// being the synchronization protocol to exchange authenticated channel
@@ -1915,12 +2265,16 @@ func (s *server) addPeer(p *peer) {
 		srvrLog.Infof("Requesting full table sync with %x",
 			p.pubKeyBytes[:])
 
-		go s.authGossiper.SynchronizeNode(p.addr.IdentityKey)
+		go s.authGossiper.SynchronizeNode(p)
 	}
 
 	// Check if there are listeners waiting for this peer to come online.
-	for _, con := range s.peerConnectedListeners[pubStr] {
-		close(con)
+	for _, peerChan := range s.peerConnectedListeners[pubStr] {
+		select {
+		case peerChan <- p:
+		case <-s.quit:
+			return
+		}
 	}
 	delete(s.peerConnectedListeners, pubStr)
 }
@@ -2046,17 +2400,36 @@ func (s *server) ConnectToPeer(addr *lnwire.NetAddress, perm bool) error {
 	// connect to the target peer. If the we can't make the connection, or
 	// the crypto negotiation breaks down, then return an error to the
 	// caller.
-	conn, err := brontide.Dial(s.identityPriv, addr, cfg.net.Dial)
-	if err != nil {
+	errChan := make(chan error, 1)
+	s.connectToPeer(addr, errChan)
+
+	select {
+	case err := <-errChan:
 		return err
+	case <-s.quit:
+		return ErrServerShuttingDown
 	}
 
-	// Once the connection has been made, we can notify the server of the
-	// new connection via our public endpoint, which will require the lock
-	// an add the peer to the server's internal state.
-	s.OutboundPeerConnected(nil, conn)
-
 	return nil
+}
+
+// connectToPeer establishes a connection to a remote peer. errChan is used to
+// notify the caller if the connection attempt has failed. Otherwise, it will be
+// closed.
+func (s *server) connectToPeer(addr *lnwire.NetAddress, errChan chan<- error) {
+	conn, err := brontide.Dial(s.identityPriv, addr, cfg.net.Dial)
+	if err != nil {
+		srvrLog.Errorf("Unable to connect to %v: %v", addr, err)
+		select {
+		case errChan <- err:
+		case <-s.quit:
+		}
+		return
+	}
+
+	close(errChan)
+
+	s.OutboundPeerConnected(nil, conn)
 }
 
 // DisconnectPeer sends the request to server to close the connection with peer
@@ -2169,7 +2542,7 @@ func (s *server) OpenChannel(nodeKey *btcec.PublicKey,
 
 	// TODO(roasbeef): pass in chan that's closed if/when funding succeeds
 	// so can track as persistent peer?
-	go s.fundingMgr.initFundingWorkflow(targetPeer.addr, req)
+	go s.fundingMgr.initFundingWorkflow(targetPeer, req)
 
 	return updateChan, errChan
 }
@@ -2247,4 +2620,123 @@ func (s *server) fetchNodeAdvertisedAddr(pub *btcec.PublicKey) (net.Addr, error)
 	}
 
 	return node.Addresses[0], nil
+}
+
+// disableChannel disables a channel, resulting in it not being able to forward
+// payments. This is done by sending a new channel update across the network
+// with the disabled flag set.
+func (s *server) disableChannel(op wire.OutPoint) error {
+	// Retrieve the latest update for this channel. We'll use this
+	// as our starting point to send the new update.
+	chanUpdate, err := s.fetchLastChanUpdateByOutPoint(op)
+	if err != nil {
+		return err
+	}
+
+	// Set the bit responsible for marking a channel as disabled.
+	chanUpdate.Flags |= lnwire.ChanUpdateDisabled
+
+	// We must now update the message's timestamp and generate a new
+	// signature.
+	chanUpdate.Timestamp = uint32(time.Now().Unix())
+
+	chanUpdateMsg, err := chanUpdate.DataToSign()
+	if err != nil {
+		return err
+	}
+
+	pubKey := s.identityPriv.PubKey()
+	sig, err := s.nodeSigner.SignMessage(pubKey, chanUpdateMsg)
+	if err != nil {
+		return err
+	}
+	chanUpdate.Signature, err = lnwire.NewSigFromSignature(sig)
+	if err != nil {
+		return err
+	}
+
+	// Once signed, we'll send the new update to all of our peers.
+	return s.applyChannelUpdate(chanUpdate)
+}
+
+// fetchLastChanUpdateByOutPoint fetches the latest update for a channel from
+// our point of view.
+func (s *server) fetchLastChanUpdateByOutPoint(op wire.OutPoint) (*lnwire.ChannelUpdate, error) {
+	graph := s.chanDB.ChannelGraph()
+	info, edge1, edge2, err := graph.FetchChannelEdgesByOutpoint(&op)
+	if err != nil {
+		return nil, err
+	}
+
+	if edge1 == nil || edge2 == nil {
+		return nil, fmt.Errorf("unable to find channel(%v)", op)
+	}
+
+	// If we're the outgoing node on the first edge, then that
+	// means the second edge is our policy. Otherwise, the first
+	// edge is our policy.
+	var local *channeldb.ChannelEdgePolicy
+
+	ourPubKey := s.identityPriv.PubKey().SerializeCompressed()
+	if bytes.Equal(edge1.Node.PubKeyBytes[:], ourPubKey) {
+		local = edge2
+	} else {
+		local = edge1
+	}
+
+	return extractChannelUpdate(info, local)
+}
+
+// extractChannelUpdate retrieves a lnwire.ChannelUpdate message from an edge's
+// info and routing policy.
+func extractChannelUpdate(info *channeldb.ChannelEdgeInfo,
+	policy *channeldb.ChannelEdgePolicy) (*lnwire.ChannelUpdate, error) {
+
+	update := &lnwire.ChannelUpdate{
+		ChainHash:       info.ChainHash,
+		ShortChannelID:  lnwire.NewShortChanIDFromInt(policy.ChannelID),
+		Timestamp:       uint32(policy.LastUpdate.Unix()),
+		Flags:           policy.Flags,
+		TimeLockDelta:   policy.TimeLockDelta,
+		HtlcMinimumMsat: policy.MinHTLC,
+		BaseFee:         uint32(policy.FeeBaseMSat),
+		FeeRate:         uint32(policy.FeeProportionalMillionths),
+	}
+
+	var err error
+	update.Signature, err = lnwire.NewSigFromRawSignature(policy.SigBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return update, nil
+}
+
+// applyChannelUpdate applies the channel update to the different sub-systems of
+// the server.
+func (s *server) applyChannelUpdate(update *lnwire.ChannelUpdate) error {
+	newChannelPolicy := &channeldb.ChannelEdgePolicy{
+		SigBytes:                  update.Signature.ToSignatureBytes(),
+		ChannelID:                 update.ShortChannelID.ToUint64(),
+		LastUpdate:                time.Unix(int64(update.Timestamp), 0),
+		Flags:                     update.Flags,
+		TimeLockDelta:             update.TimeLockDelta,
+		MinHTLC:                   update.HtlcMinimumMsat,
+		FeeBaseMSat:               lnwire.MilliSatoshi(update.BaseFee),
+		FeeProportionalMillionths: lnwire.MilliSatoshi(update.FeeRate),
+	}
+
+	err := s.chanRouter.UpdateEdge(newChannelPolicy)
+	if err != nil && !routing.IsError(err, routing.ErrIgnored) {
+		return err
+	}
+
+	pubKey := s.identityPriv.PubKey()
+	errChan := s.authGossiper.ProcessLocalAnnouncement(update, pubKey)
+	select {
+	case err := <-errChan:
+		return err
+	case <-s.quit:
+		return ErrServerShuttingDown
+	}
 }

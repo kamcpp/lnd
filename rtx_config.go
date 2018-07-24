@@ -43,7 +43,7 @@ func SetStdout(lndHomeDir *C.char) {
 
 //export StopLnd
 func StopLnd() bool {
-	shutdownRequestChannel <- struct{}{}
+	// :shutdownRequestChannel <- struct{}{}
 	success := <-shutdownSuccessChannel
 	shutdownStdout()
 	return success

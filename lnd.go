@@ -632,7 +632,7 @@ func lndMain() error {
 
 	// Wait for shutdown signal from either a graceful server stop or from
 	// the interrupt handler.
-	<-shutdownChannel
+	// <-shutdownChannel
 	ltndLog.Info("Shutdown complete")
 	shutdownSuccessChannel <- true
 	return nil
@@ -1052,8 +1052,8 @@ func waitForWalletPassword(grpcEndpoints, restEndpoints []net.Addr,
 	case <-signal.ShutdownChannel():
 		return nil, fmt.Errorf("shutting down")
 
-	case <-shutdownRequestChannel:
+	/*case <-shutdownRequestChannel:
 		shutdownSuccessChannel <- true
-		return nil, fmt.Errorf("shutting down")
+		return nil, fmt.Errorf("shutting down")*/
 	}
 }

@@ -9,7 +9,6 @@ RUN mkdir -p /go/src/github.com/kamcpp
 RUN cd /go/src/github.com/kamcpp && git clone https://github.com/kamcpp/lnd
 RUN cd /go/src/github.com/kamcpp/lnd && git fetch
 RUN cd /go/src/github.com/kamcpp/lnd && git checkout newmerge
-RUN cd /go/src/github.com/kamcpp/lnd && git pull origin newmerge
 RUN ln -s /go/src/github.com/kamcpp/lnd/olu.sh /olu.sh
 
 ENTRYPOINT /olu.sh && /bin/bash

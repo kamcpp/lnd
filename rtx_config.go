@@ -16,7 +16,8 @@ import (
 
 var (
 	channelDB              *channeldb.DB
-	shutdownSuccessChannel          = make(chan bool)
+	shutdownRequestChannel = make(chan bool)
+	shutdownSuccessChannel = make(chan bool)
 	fout                   *os.File = nil
 	ferr                   *os.File = nil
 )
@@ -43,7 +44,7 @@ func SetStdout(lndHomeDir *C.char) {
 
 //export StopLnd
 func StopLnd() bool {
-	// :shutdownRequestChannel <- struct{}{}
+	shutdownRequestChannel <- true
 	success := <-shutdownSuccessChannel
 	shutdownStdout()
 	return success
